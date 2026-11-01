@@ -1,0 +1,7 @@
+.build/
+.swiftpm/
+*.app
+*.app.zip
+.DS_Store
+javdb_links_out/
+__pycache__/
