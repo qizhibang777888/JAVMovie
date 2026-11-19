@@ -12,3 +12,7 @@ JAVMovie.app/
 
 # 本地备用素材（未接入代码的大图）
 AppAssets/
+
+# 发行包
+*.dmg
+*.zip
