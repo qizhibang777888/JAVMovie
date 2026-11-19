@@ -1,7 +1,14 @@
+# Swift / SwiftPM
 .build/
 .swiftpm/
+Package.resolved
+
+# 构建产物（用 build.sh 现场生成）
 *.app
-*.app.zip
+JAVMovie.app/
+
+# 系统垃圾
 .DS_Store
-javdb_links_out/
-__pycache__/
+
+# 本地备用素材（未接入代码的大图）
+AppAssets/

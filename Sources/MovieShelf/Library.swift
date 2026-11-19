@@ -10,7 +10,8 @@ enum Scanner {
 
     nonisolated(unsafe) static var plainMode = false
 
-    static func scan(root: URL, deep: Bool = false) -> [Movie] {
+    static func scan(root: URL, deep: Bool = false,
+                     progress: (@MainActor @Sendable ([Movie]) -> Void)? = nil) async -> [Movie] {
         lastError = nil
         let fm = FileManager.default
         let entries: [URL]
@@ -32,7 +33,7 @@ enum Scanner {
             let keys: [URLResourceKey] = [.isRegularFileKey, .isDirectoryKey]
             if let walker = fm.enumerator(at: root, includingPropertiesForKeys: keys,
                                           options: [.skipsHiddenFiles, .skipsPackageDescendants]) {
-                for case let f as URL in walker {
+                while let f = walker.nextObject() as? URL {
                     let name = f.lastPathComponent
                     if name.hasPrefix(".") || name.hasPrefix("._") { continue }
                     let isDir = (try? f.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
@@ -57,15 +58,45 @@ enum Scanner {
             }
         }
 
+        // 多个视频经常共用一个文件夹（TX.json、FM.jpg）。不要为每个视频
+        // 重复读取 JSON 和列举整个目录；USB 盘上这些小 I/O 延迟会被放大。
+        struct FolderAssets {
+            let tx: TxInfo?
+            let imageNames: [String]
+        }
+        var folderCache: [String: FolderAssets] = [:]
+
         var movies: [Movie] = []
         for t in targets {
             let code = NameParser.code(from: t.file.lastPathComponent)
-            let tx = plainMode ? nil : readTx(in: t.folder)
+            let folderKey = t.folder.path
+            let assets: FolderAssets
+            if let cached = folderCache[folderKey] {
+                assets = cached
+            } else {
+                let names = (try? fm.contentsOfDirectory(atPath: folderKey)) ?? []
+                let loaded = FolderAssets(tx: plainMode ? nil : readTx(in: t.folder), imageNames: names)
+                folderCache[folderKey] = loaded
+                assets = loaded
+            }
+            let tx = assets.tx
             let stem = (t.file.lastPathComponent as NSString).deletingPathExtension
             let values = try? t.file.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
             let bytes = Int64(values?.fileSize ?? 0)
 
-            let cover = plainMode ? nil : findCover(in: t.folder, stem: stem, code: tx?.code ?? code)
+            let cover: URL?
+            if plainMode {
+                cover = nil
+            } else {
+                let images = assets.imageNames.filter { NameParser.imageExts.contains(($0 as NSString).pathExtension.lowercased()) }
+                let lower = images.map { ($0, $0.lowercased()) }
+                func pick(_ target: String) -> URL? {
+                    guard let hit = lower.first(where: { $0.1 == target.lowercased() })?.0 else { return nil }
+                    return t.folder.appendingPathComponent(hit)
+                }
+                cover = pick("FM.jpg") ?? pick("FM.jpeg") ?? pick(stem + ".jpg")
+                    ?? ((tx?.code ?? code).isEmpty ? nil : pick((tx?.code ?? code) + ".jpg"))
+            }
             let shots = (tx?.shots ?? []).compactMap { name -> URL? in
                 let u = t.folder.appendingPathComponent(name)
                 return fm.fileExists(atPath: u.path) ? u : nil
@@ -96,6 +127,10 @@ enum Scanner {
                 cover: cover,
                 shots: shots
             ))
+            // 先把已完成的一批显示出来，不必等整个目录（尤其是 USB 盘）扫描完。
+            if movies.count.isMultiple(of: 24), let progress {
+                await progress(movies)
+            }
         }
         return movies.sorted { $0.url.lastPathComponent.localizedStandardCompare($1.url.lastPathComponent) == .orderedAscending }
     }
@@ -151,6 +186,35 @@ enum Player {
         }
         NSWorkspace.shared.open(url)
     }
+}
+
+
+/// AVFoundation 打不开的容器（MKV/HEVC 等）用 ffprobe 兜底读时长/分辨率
+func ffprobeMeta(_ url: URL) -> (duration: Double?, resolution: String?) {
+    let candidates = ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe"]
+    guard let tool = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+        return (nil, nil)
+    }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: tool)
+    p.arguments = ["-v", "error", "-show_entries", "format=duration",
+                   "-show_entries", "stream=codec_type,height", "-of", "json", url.path]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    do { try p.run() } catch { return (nil, nil) }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return (nil, nil) }
+    var dur: Double?
+    if let f = obj["format"] as? [String: Any], let d = f["duration"] as? String { dur = Double(d) }
+    var res: String?
+    if let streams = obj["streams"] as? [[String: Any]],
+       let v = streams.first(where: { ($0["codec_type"] as? String) == "video" }),
+       let h = v["height"] as? Int, h > 0 {
+        res = "\(h)p"
+    }
+    return (dur, res)
 }
 
 // MARK: - 状态
@@ -212,8 +276,12 @@ final class LibraryStore: ObservableObject {
         Task {
             // 先做一次主线程的轻量访问：让 macOS 有机会弹出「可移除宗卷」授权
             _ = try? FileManager.default.contentsOfDirectory(atPath: dir.path)
+            let publishProgress: @MainActor @Sendable ([Movie]) -> Void = { batch in
+                guard token == self.loadToken else { return }
+                self.movies = batch
+            }
             let found = await Task.detached(priority: .userInitiated) {
-                Scanner.scan(root: dir)
+                await Scanner.scan(root: dir, progress: publishProgress)
             }.value
             if ProcessInfo.processInfo.environment["ID_LOG"] != nil {
                 for m in found.prefix(3) {
@@ -223,10 +291,6 @@ final class LibraryStore: ObservableObject {
             guard token == self.loadToken else { return }   // 已有更新的请求，丢弃这次结果
             self.lastError = Scanner.lastError
             self.movies = found
-            if self.favorites.isEmpty {
-                self.favorites = Array(found.prefix(self.favoriteLimit).map(Self.favKey))
-                self.saveFavorites()
-            }
             let keys = Set(found.map(Self.favKey))
             self.favorites = self.favorites.filter { keys.contains($0) }
             self.carouselIndex = min(2, max(0, self.favorites.count - 1))
@@ -235,19 +299,105 @@ final class LibraryStore: ObservableObject {
         }
     }
 
-    /// 补时长 / 分辨率（AVFoundation，只看头部，很快）
+    /// 时长/分辨率缓存：key = 路径，value = [mtime, 字节数, 时长, 分辨率]
+    private struct Probe: Codable { var mtime: Double; var bytes: Double; var duration: Double?; var resolution: String? }
+
+    private static let probeCacheURL: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent("MovieShelf", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("probes.json")
+    }()
+
+    private static func readProbeCache() -> [String: Probe] {
+        guard let data = try? Data(contentsOf: probeCacheURL),
+              let map = try? JSONDecoder().decode([String: Probe].self, from: data) else { return [:] }
+        return map
+    }
+
+    private static func writeProbeCache(_ map: [String: Probe]) {
+        guard let data = try? JSONEncoder().encode(map) else { return }
+        try? data.write(to: probeCacheURL, options: .atomic)
+    }
+
+    /// 补时长 / 分辨率。
+    /// 以前是逐个 `movies[i].duration = ...`（每个都 publish → reloadAll → 重建 138 张卡），
+    /// 现在：后台并发探测 → **分批**写回（每批 12 条）+ 结果落盘缓存，UI 只原地刷新文字。
     private func loadDurations() async {
-        for i in movies.indices where movies[i].duration == nil {
-            let asset = AVURLAsset(url: movies[i].url)
-            if let d = try? await asset.load(.duration) {
-                let secs = CMTimeGetSeconds(d)
-                if secs.isFinite && secs > 0 { movies[i].duration = secs }
-            }
-            if let track = try? await asset.loadTracks(withMediaType: .video).first,
-               let size = try? await track.load(.naturalSize) {
-                movies[i].resolution = "\(Int(abs(size.height)))p"
-            }
+        var snapshot = movies
+        let cache = Self.readProbeCache()
+        var map = cache
+        var dirty = false
+
+        // 1) 缓存命中先填（不 publish）
+        for i in snapshot.indices {
+            guard let c = cache[snapshot[i].url.path] else { continue }
+            guard c.mtime == snapshot[i].modified.timeIntervalSince1970,
+                  c.bytes == Double(snapshot[i].bytes) else { continue }
+            if snapshot[i].duration == nil { snapshot[i].duration = c.duration }
+            if snapshot[i].resolution == nil { snapshot[i].resolution = c.resolution }
         }
+
+        // 2) 缺的按批探测（每批并发 4 个 AVAsset，避免 USB 盘排队过久）
+        let pending = snapshot.indices.filter { snapshot[$0].duration == nil || snapshot[$0].resolution == nil }
+        let batchSize = 12
+        var cursor = 0
+        while cursor < pending.count {
+            let chunk = Array(pending[cursor..<min(cursor + batchSize, pending.count)])
+            cursor += batchSize
+            let jobs = chunk.map { (idx: $0, url: snapshot[$0].url,
+                                    mtime: snapshot[$0].modified.timeIntervalSince1970,
+                                    bytes: Double(snapshot[$0].bytes)) }
+            let probed = await Task.detached(priority: .utility) { () -> [Int: Probe] in
+                await withTaskGroup(of: (Int, Probe).self) { group in
+                    var pendingJobs = jobs[...]
+                    var out: [Int: Probe] = [:]
+                    let limit = 4
+                    func add(_ job: (idx: Int, url: URL, mtime: Double, bytes: Double)) {
+                        group.addTask {
+                            var p = Probe(mtime: job.mtime, bytes: job.bytes, duration: nil, resolution: nil)
+                            let asset = AVURLAsset(url: job.url)
+                            if let d = try? await asset.load(.duration) {
+                                let secs = CMTimeGetSeconds(d)
+                                if secs.isFinite && secs > 0 { p.duration = secs }
+                            }
+                            if let track = try? await asset.loadTracks(withMediaType: .video).first,
+                               let size = try? await track.load(.naturalSize) {
+                                p.resolution = "\(Int(abs(size.height)))p"
+                            }
+                            if p.duration == nil || p.resolution == nil {
+                                let meta = ffprobeMeta(job.url)
+                                if p.duration == nil { p.duration = meta.duration }
+                                if p.resolution == nil { p.resolution = meta.resolution }
+                            }
+                            return (job.idx, p)
+                        }
+                    }
+                    for _ in 0..<min(limit, pendingJobs.count) {
+                        if let j = pendingJobs.first { pendingJobs.removeFirst(); add(j) }
+                    }
+                    while let (idx, p) = await group.next() {
+                        out[idx] = p
+                        if let j = pendingJobs.first { pendingJobs.removeFirst(); add(j) }
+                    }
+                    return out
+                }
+            }.value
+
+            var changed = false
+            for (i, p) in probed {
+                if snapshot[i].duration == nil { snapshot[i].duration = p.duration; changed = true }
+                if snapshot[i].resolution == nil { snapshot[i].resolution = p.resolution; changed = true }
+                map[snapshot[i].url.path] = p
+            }
+            dirty = true
+            if changed { movies = snapshot }     // 一批一次 publish（卡片原地刷新）
+            Self.writeProbeCache(map)            // 每批落盘：中途退出也不白探
+        }
+
+        if snapshot != movies { movies = snapshot }
+        if dirty { Self.writeProbeCache(map) }
     }
 
     // MARK: 列表

@@ -48,6 +48,24 @@ enum CoverLoader {
         guard let img = image(url) else { return }
         view.layer?.contents = img.cgImage(forProposedRect: nil, context: nil, hints: nil)
     }
+
+    /// 卡片网格一次会创建整库的卡片；封面文件读取/解码不能在主线程串行做，
+    /// 否则首屏会等所有卡片初始化完才出现。先显示卡片占位底色，再异步贴图。
+    @MainActor
+    static func applyAsync(_ url: URL?, to view: NSView) {
+        guard let url else { return }
+        if let hit = cache.object(forKey: url as NSURL) {
+            view.layer?.contents = hit.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            return
+        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak view] in
+            guard let img = image(url),
+                  let cg = img.cgImage(forProposedRect: nil, context: nil, hints: nil) else { return }
+            DispatchQueue.main.async {
+                view?.layer?.contents = cg
+            }
+        }
+    }
 }
 
 // MARK: - 卡片
@@ -56,7 +74,7 @@ final class CardView: NSView {
     let movie: Movie
     private let coverView = NSView()
     private let shineLayer = CAGradientLayer()
-    private let codeBadge = NSTextField(labelWithString: "")
+    private let codeBadge = NSButton()
     private let titleLabel = NSTextField(labelWithString: "")
     private let subLabel = NSTextField(labelWithString: "")
     private let starButton = NSButton()
@@ -67,6 +85,7 @@ final class CardView: NSView {
 
     var onPlay: ((_ inApp: Bool) -> Void)?      // 点圆形播放键
     var onPreview: (() -> Void)?                 // 点封面本体 → 看剧照
+    var onOpenJavdb: ((URL) -> Void)?            // 点番号 → 外部浏览器打开（置空则用系统默认浏览器）
     var onToggleFavorite: (() -> Void)?
     var onDelete: (() -> Void)?
     /// 在轮播里设为 true：鼠标事件上抛给 CarouselView（支持从封面开始拖拽）
@@ -97,14 +116,17 @@ final class CardView: NSView {
         codeBadge.isHidden = true
         subLabel.isHidden = true
         titleLabel.stringValue = plainTitle ?? movie.displayName
-        // 没有封面就用视频首帧当缩略图
-        if movie.cover == nil {
-            VideoThumb.load(movie.url, position: .middle) { [weak self] image in
-                guard let self, let image else { return }
-                var rect = CGRect(origin: .zero, size: image.size)
-                if let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) {
-                    self.coverView.layer?.contents = cg
-                }
+        loadFallbackThumb()
+    }
+
+    /// 没有番号包装图（javdb 查不到 / 本地没有 FM.jpg）→ 直接拿视频中间一帧当封面
+    private func loadFallbackThumb() {
+        guard movie.cover == nil else { return }
+        VideoThumb.load(movie.url, position: .middle) { [weak self] image in
+            guard let self, let image else { return }
+            var rect = CGRect(origin: .zero, size: image.size)
+            if let cg = image.cgImage(forProposedRect: &rect, context: nil, hints: nil) {
+                self.coverView.layer?.contents = cg
             }
         }
     }
@@ -113,11 +135,13 @@ final class CardView: NSView {
         coverView.wantsLayer = true
         coverView.layer?.cornerRadius = 12
         coverView.layer?.masksToBounds = true
+        coverView.layer?.contentsGravity = .resizeAspectFill
         coverView.layer?.backgroundColor = NSColor(calibratedWhite: 0.1, alpha: 1).cgColor
         coverView.layer?.borderWidth = 1
         coverView.layer?.borderColor = NSColor(calibratedWhite: 1, alpha: 0.07).cgColor
         addSubview(coverView)
-        CoverLoader.apply(movie.cover, to: coverView)
+        CoverLoader.applyAsync(movie.cover, to: coverView)
+        loadFallbackThumb()          // 番号查不到页面 / 无 FM.jpg 时用视频帧兜底
 
         shineLayer.colors = [NSColor.black.withAlphaComponent(0).cgColor,
                              NSColor.black.withAlphaComponent(0.55).cgColor]
@@ -125,45 +149,81 @@ final class CardView: NSView {
         shineLayer.endPoint = CGPoint(x: 0.5, y: 1)
         coverView.layer?.addSublayer(shineLayer)
 
-        codeBadge.stringValue = movie.code.isEmpty ? movie.url.pathExtension.uppercased() : movie.code
-        codeBadge.font = Theme.mono(11, .semibold)
-        codeBadge.textColor = .white
+        // 番号按钮：用 NSButton（标题上下居中），点一下去 JavDB 对应页面
+        let badgeText = movie.code.isEmpty ? movie.url.pathExtension.uppercased() : movie.code
+        codeBadge.title = badgeText
+        codeBadge.attributedTitle = NSAttributedString(string: badgeText, attributes: [
+            .font: Theme.mono(12, .bold),
+            .foregroundColor: NSColor.white,
+        ])
+        codeBadge.isBordered = false
+        codeBadge.bezelStyle = .regularSquare
+        codeBadge.imagePosition = .noImage
         codeBadge.wantsLayer = true
-        codeBadge.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
-        codeBadge.layer?.cornerRadius = 6
-        codeBadge.alignment = .center
+        codeBadge.layer?.backgroundColor = NSColor(calibratedRed: 0.35, green: 0.28, blue: 0.85, alpha: 0.94).cgColor
+        codeBadge.layer?.cornerRadius = 8
+        codeBadge.layer?.borderWidth = 1
+        codeBadge.layer?.borderColor = NSColor.white.withAlphaComponent(0.22).cgColor
+        codeBadge.layer?.shadowColor = NSColor.black.cgColor
+        codeBadge.layer?.shadowOpacity = 0.45
+        codeBadge.layer?.shadowRadius = 5
+        codeBadge.layer?.shadowOffset = CGSize(width: 0, height: 2)
+        codeBadge.target = self
+        codeBadge.action = #selector(openJavdbPage)
+        codeBadge.toolTip = movie.jdvbURL == nil ? "在 JavDB 搜索 \(badgeText)" : "在 JavDB 打开 \(badgeText)"
         addSubview(codeBadge)
 
+        // 删除：红色按钮
         deleteButton.isBordered = false
         deleteButton.bezelStyle = .regularSquare
-        deleteButton.image = NSImage(systemSymbolName: "trash", accessibilityDescription: "删除")?
-            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold))
-        deleteButton.contentTintColor = NSColor(calibratedWhite: 1, alpha: 0.9)
+        deleteButton.image = NSImage(systemSymbolName: "trash.fill", accessibilityDescription: "删除")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold))
+        deleteButton.contentTintColor = .white
         deleteButton.wantsLayer = true
-        deleteButton.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
-        deleteButton.layer?.cornerRadius = 13
+        deleteButton.layer?.backgroundColor = NSColor(calibratedRed: 0.92, green: 0.28, blue: 0.32, alpha: 0.92).cgColor
+        deleteButton.layer?.cornerRadius = 15
+        deleteButton.layer?.borderWidth = 1
+        deleteButton.layer?.borderColor = NSColor.white.withAlphaComponent(0.28).cgColor
+        deleteButton.layer?.shadowColor = NSColor.black.cgColor
+        deleteButton.layer?.shadowOpacity = 0.45
+        deleteButton.layer?.shadowRadius = 6
+        deleteButton.layer?.shadowOffset = CGSize(width: 0, height: 2)
         deleteButton.target = self
         deleteButton.action = #selector(deleteTapped)
         addSubview(deleteButton)
 
+        // 收藏：金色按钮
         starButton.isBordered = false
         starButton.imagePosition = .imageOnly
-        starButton.contentTintColor = Theme.dim
+        starButton.imageScaling = .scaleProportionallyDown
+        starButton.wantsLayer = true
+        starButton.layer?.cornerRadius = 15
+        starButton.layer?.borderWidth = 1
+        starButton.layer?.shadowColor = NSColor.black.cgColor
+        starButton.layer?.shadowOpacity = 0.45
+        starButton.layer?.shadowRadius = 6
+        starButton.layer?.shadowOffset = CGSize(width: 0, height: 2)
         starButton.target = self
         starButton.action = #selector(toggleFavorite)
         addSubview(starButton)
 
+        // 播放：紫色大圆钮，常显（鼠标停留展示仍停用）
         playButton.isBordered = false
         playButton.bezelStyle = .regularSquare
-        playButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "播放")
+        playButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "播放")?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 28, weight: .bold))
         playButton.contentTintColor = .white
         playButton.wantsLayer = true
-        playButton.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.5).cgColor
-        playButton.layer?.cornerRadius = 30
+        playButton.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.38).cgColor
+        playButton.layer?.cornerRadius = 34
         playButton.layer?.borderWidth = 1
-        playButton.layer?.borderColor = NSColor.white.withAlphaComponent(0.25).cgColor
+        playButton.layer?.borderColor = NSColor.white.withAlphaComponent(0.32).cgColor
+        playButton.layer?.shadowColor = NSColor.black.cgColor
+        playButton.layer?.shadowOpacity = 0.5
+        playButton.layer?.shadowRadius = 12
+        playButton.layer?.shadowOffset = CGSize(width: 0, height: 4)
         playButton.imageScaling = .scaleProportionallyDown
-        playButton.alphaValue = 0
+        playButton.alphaValue = FeatureFlags.hoverEnabled ? 0 : 1
         playButton.target = self
         playButton.action = #selector(activate)
         addSubview(playButton)
@@ -188,7 +248,15 @@ final class CardView: NSView {
         addSubview(subLabel)
     }
 
-    private var subtitle: String {
+    /// 只刷新随探测结果变化的文字/星标，不重建视图
+    func refreshMeta(_ m: Movie) {
+        titleLabel.stringValue = m.title
+        subLabel.stringValue = subtitle(for: m)
+    }
+
+    private var subtitle: String { subtitle(for: movie) }
+
+    private func subtitle(for movie: Movie) -> String {
         var parts: [String] = []
         if let maker = movie.maker, !maker.isEmpty { parts.append(maker) }
         if let score = movie.score { parts.append(String(format: "★%.2f", score)) }
@@ -208,8 +276,15 @@ final class CardView: NSView {
 
     func setFavorite(_ on: Bool) {
         let name = on ? "star.fill" : "star"
-        starButton.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
-        starButton.contentTintColor = on ? Theme.gold : NSColor.white.withAlphaComponent(0.65)
+        starButton.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold))
+        starButton.contentTintColor = on ? .white : Theme.gold
+        starButton.layer?.backgroundColor = on
+            ? NSColor(calibratedRed: 1.0, green: 0.72, blue: 0.22, alpha: 0.96).cgColor
+            : NSColor(calibratedRed: 0.16, green: 0.13, blue: 0.08, alpha: 0.82).cgColor
+        starButton.layer?.borderColor = on
+            ? NSColor(calibratedRed: 1, green: 0.92, blue: 0.62, alpha: 0.7).cgColor
+            : Theme.gold.withAlphaComponent(0.55).cgColor
     }
 
     /// 0 = 原样，1 = 全黑
@@ -223,14 +298,14 @@ final class CardView: NSView {
         let coverH = (w * 2 / 3).rounded()
         coverView.frame = NSRect(x: 0, y: 0, width: w, height: coverH)
         shineLayer.frame = coverView.bounds
-        deleteButton.frame = NSRect(x: 8, y: coverH - 8 - 26, width: 26, height: 26)
-        codeBadge.sizeToFit()
-        let badgeSize = NSSize(width: codeBadge.frame.width + 12, height: 20)
-        codeBadge.frame = NSRect(x: deleteButton.frame.maxX + 6, y: coverH - 10 - badgeSize.height,
-                                 width: badgeSize.width, height: badgeSize.height)
-        starButton.frame = NSRect(x: w - 38, y: 10, width: 28, height: 22)
+        deleteButton.frame = NSRect(x: 8, y: coverH - 8 - 30, width: 30, height: 30)
+        let badgeFont = Theme.mono(12, .bold)
+        let badgeWidth = ceil((codeBadge.title as NSString).size(withAttributes: [.font: badgeFont]).width) + 20
+        codeBadge.frame = NSRect(x: deleteButton.frame.maxX + 8, y: coverH - 10 - 24,
+                                 width: badgeWidth, height: 24)
+        starButton.frame = NSRect(x: w - 42, y: 10, width: 30, height: 30)
 
-        playButton.frame = NSRect(x: (w - 60) / 2, y: (coverH - 60) / 2, width: 60, height: 60)
+        playButton.frame = NSRect(x: (w - 68) / 2, y: (coverH - 68) / 2, width: 68, height: 68)
         dimOverlay.frame = NSRect(x: 0, y: 0, width: w, height: coverH)
         titleLabel.frame = NSRect(x: 2, y: coverH + 8, width: w - 4, height: 17)
         subLabel.frame = NSRect(x: 2, y: coverH + 26, width: w - 4, height: 15)
@@ -245,6 +320,8 @@ final class CardView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        // 鼠标「停留展示」先停用：开关在 FeatureFlags.hoverEnabled（代码保留）
+        guard FeatureFlags.hoverEnabled else { return }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.16
             playButton.animator().alphaValue = 1
@@ -252,6 +329,7 @@ final class CardView: NSView {
     }
 
     override func mouseExited(with event: NSEvent) {
+        guard FeatureFlags.hoverEnabled else { return }
         NSAnimationContext.runAnimationGroup { ctx in
             ctx.duration = 0.2
             playButton.animator().alphaValue = 0
@@ -277,6 +355,22 @@ final class CardView: NSView {
 
     @objc private func deleteTapped() { onDelete?() }
 
+    @objc private func openJavdbPage() {
+        guard let url = javdbURL else { return }
+        if let onOpenJavdb {
+            onOpenJavdb(url)
+        } else {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    var javdbURL: URL? {
+        if let url = movie.jdvbURL { return url }
+        let query = movie.code.isEmpty ? movie.displayName : movie.code
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        return URL(string: "https://javdb.com/search?q=\(encoded)&f=all")
+    }
+
     @objc private func activate() {
         onPlay?(NSEvent.modifierFlags.contains(.option))
     }
@@ -285,6 +379,9 @@ final class CardView: NSView {
 }
 
 // MARK: - 顶部轮播：平铺一行，焦点卡居中、两侧缩小压暗（最初的版本）
+
+/// 收藏 key 和 LibraryStore.favKey 保持一致：优先番号，没有就文件名
+func favoriteKey(_ m: Movie) -> String { m.code.isEmpty ? m.displayName : m.code }
 
 final class CarouselView: NSView {
     private var cards: [CardView] = []
@@ -300,6 +397,7 @@ final class CarouselView: NSView {
     var onNeedToggle: ((Movie) -> Void)?
     var onNeedPreview: ((Movie) -> Void)?
     var onNeedDelete: ((Movie) -> Void)?
+    var onNeedJavdb: ((URL) -> Void)?
 
     override var isFlipped: Bool { true }
     override var acceptsFirstResponder: Bool { true }
@@ -313,19 +411,32 @@ final class CarouselView: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    private var signature: [String] = []
+
     func reload(movies: [Movie], favorites: Set<String>) {
         if ProcessInfo.processInfo.environment["CARR_LOG"] != nil {
             FileHandle.standardError.write("carousel reload \(movies.count) movies, bounds=\(bounds)\n".data(using: .utf8)!)
         }
+        // 影片集合没变（只是时长/分辨率探测回来了）→ 原地刷新，绝不重建
+        if movies.map(\.id) == signature, cards.count == movies.count {
+            for (card, m) in zip(cards, movies) {
+                card.refreshMeta(m)
+                card.setFavorite(favorites.contains(favoriteKey(m)))
+            }
+            layoutCards(animated: false)
+            return
+        }
+        signature = movies.map(\.id)
         cards.forEach { $0.removeFromSuperview() }
         cards = movies.map { m in
             let cardH = max(150, bounds.height - 62)
-            let card = CardView(movie: m, favorite: favorites.contains(m.id), width: cardH * 1.5)
+            let card = CardView(movie: m, favorite: favorites.contains(favoriteKey(m)), width: cardH * 1.5)
             card.forwardsMouseToSuperview = true
             card.onPlay = { [weak self] inApp in self?.onNeedPlay?(m, inApp) }
             card.onPreview = { [weak self] in self?.onNeedPreview?(m) }
             card.onToggleFavorite = { [weak self] in self?.onNeedToggle?(m) }
             card.onDelete = { [weak self] in self?.onNeedDelete?(m) }
+            card.onOpenJavdb = { [weak self] url in self?.onNeedJavdb?(url) }
             addSubview(card)
             return card
         }
@@ -370,7 +481,8 @@ final class CarouselView: NSView {
                 }
                 let ad = CGFloat(abs(d))
                 // 两侧不再压到全黑：仍比中间暗，但封面清晰可见
-                card.animator().alphaValue = d == 0 ? 1 : max(0.45, 1 - ad * 0.22)
+                let alpha = d == 0 ? 1 : max(0.45, 1 - ad * 0.22)
+                if animated { card.animator().alphaValue = alpha } else { card.alphaValue = alpha }
                 card.setDim(d == 0 ? 0 : min(0.45, 0.20 + (ad - 1) * 0.10))
                 let scale = d == 0 ? 1 : max(0.86, 1 - CGFloat(abs(d)) * 0.055)
                 card.layer?.setAffineTransform(CGAffineTransform(scaleX: scale, y: scale))
@@ -533,8 +645,16 @@ final class PillLinkButton: NSView {
         tracking = t
     }
 
-    override func mouseEntered(with event: NSEvent) { setHover(true) }
-    override func mouseExited(with event: NSEvent) { setHover(false) }
+    // 悬停高亮同样跟随「鼠标停留展示」开关
+    override func mouseEntered(with event: NSEvent) {
+        guard FeatureFlags.hoverEnabled else { return }
+        setHover(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        guard FeatureFlags.hoverEnabled else { return }
+        setHover(false)
+    }
 
     private func setHover(_ on: Bool) {
         hovering = on
@@ -639,6 +759,28 @@ enum VideoThumb {
     nonisolated(unsafe) private static let cacheMiddle = NSCache<NSURL, NSImage>()
     nonisolated(unsafe) private static let cacheLast = NSCache<NSURL, NSImage>()
 
+    /// AVFoundation 认不出 MKV（Errcode -11828），这时交给 ffmpeg
+    private static let ffmpegPath: String? = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        .first { FileManager.default.isExecutableFile(atPath: $0) }
+    private static let ffprobePath: String? = ["/opt/homebrew/bin/ffprobe", "/usr/local/bin/ffprobe", "/usr/bin/ffprobe"]
+        .first { FileManager.default.isExecutableFile(atPath: $0) }
+
+    /// 抽出来的帧落盘缓存，第二次开 App 不用再解一次 4K HEVC
+    nonisolated(unsafe) private static let diskDir: URL = {
+        let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        let dir = base.appendingPathComponent("MovieShelf/thumbs", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    private static func diskURL(_ url: URL, position: Position) -> URL {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325              // FNV-1a，稳定跨进程
+        for b in url.path.utf8 { h = (h ^ UInt64(b)) &* 0x1000_0000_01b3 }
+        let tag = position == .first ? "f" : (position == .middle ? "m" : "l")
+        return diskDir.appendingPathComponent(String(h, radix: 16) + "-" + tag + ".png")
+    }
+
     static func load(_ url: URL, position: Position = .first,
                      completion: @Sendable @escaping (NSImage?) -> Void) {
         let cache: NSCache<NSURL, NSImage>
@@ -651,29 +793,77 @@ enum VideoThumb {
             completion(hit)
             return
         }
+        let disk = diskURL(url, position: position)
+        if let img = NSImage(contentsOf: disk) {
+            cache.setObject(img, forKey: url as NSURL)
+            completion(img)
+            return
+        }
         DispatchQueue.global(qos: .utility).async {
-            let asset = AVURLAsset(url: url)
-            let gen = AVAssetImageGenerator(asset: asset)
-            gen.appliesPreferredTrackTransform = true
-            gen.maximumSize = CGSize(width: 720, height: 720)
-            let duration = asset.duration.seconds
-            let seconds: Double
-            switch position {
-            case .first:
-                seconds = max(1, min(30, duration * 0.1))
-            case .middle:
-                seconds = max(0, duration * 0.30)     // 中间段 30% 处
-            case .last:
-                seconds = max(0, duration - 0.6)
-            }
-            let time = CMTime(seconds: seconds.isFinite ? seconds : 3, preferredTimescale: 600)
-            var image: NSImage?
-            if let cg = try? gen.copyCGImage(at: time, actualTime: nil) {
-                image = NSImage(cgImage: cg, size: .zero)
-                if let image { cache.setObject(image, forKey: url as NSURL) }
-            }
+            var image = frameViaAV(url, position: position)
+            if image == nil { image = frameViaFFmpeg(url, position: position, out: disk) }
+            if let image { cache.setObject(image, forKey: url as NSURL) }
             DispatchQueue.main.async { completion(image) }
         }
+    }
+
+    private static func frameViaAV(_ url: URL, position: Position) -> NSImage? {
+        let asset = AVURLAsset(url: url)
+        let gen = AVAssetImageGenerator(asset: asset)
+        gen.appliesPreferredTrackTransform = true
+        gen.maximumSize = CGSize(width: 720, height: 720)
+        let duration = asset.duration.seconds
+        let seconds: Double
+        switch position {
+        case .first:
+            seconds = duration.isFinite ? max(1, min(30, duration * 0.1)) : 3
+        case .middle:
+            seconds = duration.isFinite ? max(0, duration * 0.42) : 3
+        case .last:
+            seconds = duration.isFinite ? max(0, duration - 0.6) : 3
+        }
+        let time = CMTime(seconds: seconds.isFinite ? seconds : 3, preferredTimescale: 600)
+        guard let cg = try? gen.copyCGImage(at: time, actualTime: nil) else { return nil }
+        return NSImage(cgImage: cg, size: .zero)
+    }
+
+    /// MKV / 老编码兜底：ffprobe 取时长定位，ffmpeg 抽一帧 PNG 落盘
+    private static func frameViaFFmpeg(_ url: URL, position: Position, out: URL) -> NSImage? {
+        guard let ffmpeg = ffmpegPath else { return nil }
+        let duration = probeDuration(url.path) ?? 0
+        var t: Double
+        switch position {
+        case .first:  t = duration > 4 ? max(1, duration * 0.10) : max(0, duration / 2)
+        case .middle: t = duration > 4 ? duration * 0.42 : max(0, duration / 2)
+        case .last:   t = max(0, duration - 0.6)
+        }
+        if !t.isFinite || t < 0 { t = 60 }
+
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: ffmpeg)
+        p.arguments = ["-v", "error", "-ss", String(format: "%.2f", t), "-i", url.path,
+                       "-frames:v", "1", "-vf", "scale=960:-2", "-y", out.path]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        p.waitUntilExit()
+        guard p.terminationStatus == 0, let img = NSImage(contentsOf: out) else { return nil }
+        return img
+    }
+
+    private static func probeDuration(_ path: String) -> Double? {
+        guard let ffprobe = ffprobePath else { return nil }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: ffprobe)
+        p.arguments = ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return Double(text)
     }
 }
 
@@ -1088,6 +1278,7 @@ final class GridView: FlippedView {
     var onNeedToggle: ((Movie) -> Void)?
     var onNeedPreview: ((Movie) -> Void)?
     var onNeedDelete: ((Movie) -> Void)?
+    var onNeedJavdb: ((URL) -> Void)?
 
     private let inset: CGFloat = 24
     private let gapX: CGFloat = 34
@@ -1099,11 +1290,12 @@ final class GridView: FlippedView {
         }
         cards.forEach { $0.removeFromSuperview() }
         cards = movies.map { m in
-            let card = CardView(movie: m, favorite: favorites.contains(m.id), width: 326)
+            let card = CardView(movie: m, favorite: favorites.contains(favoriteKey(m)), width: 326)
             card.onPlay = { [weak self] inApp in self?.onNeedPlay?(m, inApp) }
             card.onPreview = { [weak self] in self?.onNeedPreview?(m) }
             card.onToggleFavorite = { [weak self] in self?.onNeedToggle?(m) }
             card.onDelete = { [weak self] in self?.onNeedDelete?(m) }
+            card.onOpenJavdb = { [weak self] url in self?.onNeedJavdb?(url) }
             addSubview(card)
             return card
         }
@@ -1123,6 +1315,19 @@ final class GridView: FlippedView {
 
     func fittingHeight(for width: CGFloat) -> CGFloat { metrics(for: width).height }
 
+    /// 只保留可视范围（上下各多留一行）内的卡片，其余 isHidden。
+    /// 138 张卡 × ~18 层 = 2500+ 个 layer 全量参与合成，滚动时非常吃显卡。
+    func cull() {
+        guard !cards.isEmpty else { return }
+        let m = metrics(for: bounds.width)
+        let pad = m.cardH + gapY
+        let vis = visibleRect.insetBy(dx: 0, dy: -pad)
+        for card in cards {
+            let show = vis.intersects(card.frame)
+            if card.isHidden == show { card.isHidden = !show }
+        }
+    }
+
     override func layout() {
         super.layout()
         guard !cards.isEmpty else { return }
@@ -1133,10 +1338,11 @@ final class GridView: FlippedView {
             let y = CGFloat(10) + CGFloat(r) * (m.cardH + gapY)
             if card.frame.width != m.cardW {
                 card.frame = NSRect(x: x, y: y, width: m.cardW, height: m.cardH)
-            } else {
+            } else if card.frame.origin != NSPoint(x: x, y: y) {
                 card.setFrameOrigin(NSPoint(x: x, y: y))
             }
         }
+        cull()
     }
 }
 
@@ -1192,7 +1398,7 @@ final class ContentDocumentView: FlippedView {
 
     override func layout() {
         super.layout()
-        for v in subviews where v !== divider { v.layoutSubtreeIfNeeded() }
+        grid.cull()
     }
 }
 

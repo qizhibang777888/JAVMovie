@@ -1,6 +1,7 @@
 import AppKit
 import AVKit
 import Combine
+import QuartzCore
 
 /// 把管道输出切成整行（跨线程安全）
 final class LineBuffer: @unchecked Sendable {
@@ -117,9 +118,223 @@ final class SyncPanel: NSWindow {
     }
 }
 
+/// 全屏加载幕布：深色雾面罩 + 中央的毛玻璃卡片（和窗口本身的玻璃一致），
+/// 卡片里是黑色小人的跑步循环。
+@MainActor
+final class LibraryLoadingOverlay: NSView {
+    private let backdrop = NSVisualEffectView()
+    private let cardWrap = NSView()
+    private let card = NSVisualEffectView()
+    private let tint = NSView()
+    private let tintGradient = CAGradientLayer()
+    private let runner = RunnerAnimationView(frame: .zero)
+    private let headline = NSTextField(labelWithString: "正在加载影库")
+    private let detail = NSTextField(labelWithString: "正在扫描影片与封面")
+
+    private var isAnimating = false
+    private var shownAt: CFTimeInterval = 0
+    private var pendingHide: DispatchWorkItem?
+
+    /// 短到只闪一下会把动画变成“抖动”，所以最少让它完整跑半秒。
+    private let minimumVisible: CFTimeInterval = 0.6
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        alphaValue = 1
+        isHidden = true
+
+        backdrop.material = .underWindowBackground
+        backdrop.blendingMode = .withinWindow
+        backdrop.state = .active
+        backdrop.wantsLayer = true
+        backdrop.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.22).cgColor
+        backdrop.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(backdrop)
+
+        // 阴影放在外层，卡片自身才能裁圆角
+        cardWrap.wantsLayer = true
+        cardWrap.layer?.shadowColor = NSColor.black.cgColor
+        cardWrap.layer?.shadowOpacity = 0.34
+        cardWrap.layer?.shadowRadius = 34
+        cardWrap.layer?.shadowOffset = CGSize(width: 0, height: -14)
+        cardWrap.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(cardWrap)
+
+        // 卡片：和窗口同一种毛玻璃材质，再压一层极薄的暖白，保证黑色小人看得清
+        card.material = .underWindowBackground
+        card.blendingMode = .behindWindow
+        card.state = .active
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 30
+        card.layer?.cornerCurve = .continuous
+        card.layer?.masksToBounds = true
+        card.layer?.borderWidth = 1
+        card.layer?.borderColor = NSColor.white.withAlphaComponent(0.40).cgColor
+        card.translatesAutoresizingMaskIntoConstraints = false
+        cardWrap.addSubview(card)
+
+        tint.wantsLayer = true
+        tint.layer?.backgroundColor = NSColor(calibratedRed: 1.0, green: 0.995, blue: 0.985,
+                                              alpha: 0.82).cgColor
+        tint.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(tint)
+
+        runner.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(runner)
+
+        let centered = NSMutableParagraphStyle()
+        centered.alignment = .center
+        headline.attributedStringValue = NSAttributedString(
+            string: "正在加载影库",
+            attributes: [
+                .font: Theme.font(16.5, .semibold),
+                .foregroundColor: NSColor(calibratedWhite: 0.10, alpha: 1),
+                .kern: 1.6,
+                .paragraphStyle: centered,
+            ]
+        )
+        headline.alignment = .center
+        headline.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        headline.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        headline.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(headline)
+
+        detail.attributedStringValue = NSAttributedString(
+            string: "正在扫描影片与封面…",
+            attributes: [
+                .font: Theme.font(12),
+                .foregroundColor: NSColor(calibratedWhite: 0.10, alpha: 0.48),
+                .kern: 0.4,
+                .paragraphStyle: centered,
+            ]
+        )
+        detail.alignment = .center
+        detail.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        detail.setContentCompressionResistancePriority(NSLayoutConstraint.Priority(1), for: .horizontal)
+        detail.translatesAutoresizingMaskIntoConstraints = false
+        card.addSubview(detail)
+
+        NSLayoutConstraint.activate([
+            backdrop.topAnchor.constraint(equalTo: topAnchor),
+            backdrop.bottomAnchor.constraint(equalTo: bottomAnchor),
+            backdrop.leadingAnchor.constraint(equalTo: leadingAnchor),
+            backdrop.trailingAnchor.constraint(equalTo: trailingAnchor),
+
+            cardWrap.centerXAnchor.constraint(equalTo: centerXAnchor),
+            cardWrap.centerYAnchor.constraint(equalTo: centerYAnchor),
+            cardWrap.widthAnchor.constraint(equalToConstant: 392),
+            cardWrap.heightAnchor.constraint(equalToConstant: 300),
+
+            card.topAnchor.constraint(equalTo: cardWrap.topAnchor),
+            card.bottomAnchor.constraint(equalTo: cardWrap.bottomAnchor),
+            card.leadingAnchor.constraint(equalTo: cardWrap.leadingAnchor),
+            card.trailingAnchor.constraint(equalTo: cardWrap.trailingAnchor),
+
+            tint.topAnchor.constraint(equalTo: card.topAnchor),
+            tint.bottomAnchor.constraint(equalTo: card.bottomAnchor),
+            tint.leadingAnchor.constraint(equalTo: card.leadingAnchor),
+            tint.trailingAnchor.constraint(equalTo: card.trailingAnchor),
+
+            runner.topAnchor.constraint(equalTo: card.topAnchor, constant: 18),
+            runner.centerXAnchor.constraint(equalTo: card.centerXAnchor),
+            runner.widthAnchor.constraint(equalToConstant: 336),
+            runner.heightAnchor.constraint(equalToConstant: 198),
+
+            headline.topAnchor.constraint(equalTo: runner.bottomAnchor, constant: 6),
+            headline.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 20),
+            headline.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
+
+            detail.topAnchor.constraint(equalTo: headline.bottomAnchor, constant: 7),
+            detail.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 20),
+            detail.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -20),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func layout() {
+        super.layout()
+        guard !cardWrap.bounds.isEmpty else { return }
+        cardWrap.layer?.shadowPath = CGPath(roundedRect: cardWrap.bounds,
+                                            cornerWidth: 30, cornerHeight: 30,
+                                            transform: nil)
+    }
+
+    func setLoading(_ loading: Bool) {
+        guard loading != isAnimating else { return }
+        isAnimating = loading
+        pendingHide?.cancel()
+        pendingHide = nil
+
+        if loading {
+            shownAt = CACurrentMediaTime()
+            alphaValue = 0
+            isHidden = false
+            runner.startAnimation()
+            card.layer?.removeAnimation(forKey: "pop")
+            let pop = CABasicAnimation(keyPath: "transform.scale")
+            pop.fromValue = 0.965
+            pop.toValue = 1
+            pop.duration = 0.34
+            pop.timingFunction = CAMediaTimingFunction(controlPoints: 0.18, 0.9, 0.2, 1)
+            card.layer?.add(pop, forKey: "pop")
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.26
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                animator().alphaValue = 1
+            }
+        } else {
+            let elapsed = CACurrentMediaTime() - shownAt
+            let delay = max(0, minimumVisible - elapsed)
+            let work = DispatchWorkItem { [weak self] in self?.fadeOut() }
+            pendingHide = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    }
+
+    private func fadeOut() {
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = 0.28
+            context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+            animator().alphaValue = 0
+        }, completionHandler: { [weak self] in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isAnimating else { return }   // 淡出途中又开始了新的加载
+                self.isHidden = true
+                self.alphaValue = 1
+                self.runner.stopAnimation()
+            }
+        })
+    }
+}
+
 @MainActor
 final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     let store = LibraryStore()
+
+    override init() {
+        super.init()
+        let defaults = UserDefaults.standard
+        var schema = defaults.integer(forKey: "tabSchema")
+        var tab = defaults.integer(forKey: "activeTab")
+        if schema < 1 {
+            if tab > 0 { tab += 1 }
+            schema = 1
+        }
+        if schema < 2 {
+            // 新增「搜索集」插在国产后面：原 3=短剧 → 4
+            if tab >= 3 { tab += 1 }
+            schema = 2
+        }
+        if schema < 3 {
+            // 删除 JAVWEB / 搜索集 / 短剧：老索引 2=国产 → 1，其余非 0 一律回到 JAV
+            tab = (tab == 2) ? 1 : 0
+            schema = 3
+        }
+        defaults.set(tab, forKey: "activeTab")
+        defaults.set(schema, forKey: "tabSchema")
+        activeTab = min(1, max(0, tab))
+    }
     var window: NSWindow!
 
     private let carousel = CarouselView()
@@ -139,15 +354,11 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     private let toast = NSTextField(labelWithString: "")
     private let bannerBar = NSView()
     private let bannerLabel = NSTextField(labelWithString: "")
+    private let loadingOverlay = LibraryLoadingOverlay(frame: .zero)
     private lazy var guochangPage: GuochangPage = {
         let page = GuochangPage(frame: .zero)
         page.onPlay = { [weak self] movie, inApp in self?.play(movie, inApp: inApp) }
-        page.onPreview = { [weak self] movie in self?.openShotViewer(movie) }
-        return page
-    }()
-    private lazy var duanjuPage: WebPage = {
-        let page = WebPage(url: URL(string: "https://huangguoai.com/ai-duanju/")!)
-        page.isHidden = true
+        page.onPreview = { [weak self] movie in self?.previewOrPlay(movie) }
         return page
     }()
     private var shotViewer: ShotViewer?
@@ -157,6 +368,8 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     private var playerWindow: NSWindow?
     private var playerView: AVPlayerView?
     private var cancellables = Set<AnyCancellable>()
+    /// 仅用于截图核对加载动画（LOADING_PREVIEW=1 时幕布常驻）。
+    private let loadingPreview = ProcessInfo.processInfo.environment["LOADING_PREVIEW"] == "1"
 
     // MARK: 窗口
 
@@ -167,8 +380,13 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         window.title = "JAVMovie · 本地影库"
         window.titlebarAppearsTransparent = true
         window.titleVisibility = .hidden
-        window.isOpaque = false                      // 液态玻璃：窗口本身透明
-        window.backgroundColor = .clear
+        if ProcessInfo.processInfo.environment["GLASS"] == "0" {
+            window.isOpaque = true                   // 诊断用：不透明窗口
+            window.backgroundColor = NSColor(calibratedWhite: 0.07, alpha: 1)
+        } else {
+            window.isOpaque = false                  // 液态玻璃：窗口本身透明
+            window.backgroundColor = .clear
+        }
         window.hasShadow = true
         window.appearance = NSAppearance(named: .darkAqua)
         window.delegate = self
@@ -178,8 +396,12 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         window.makeKeyAndOrderFront(nil)
         bindStore()
         applyTabRoot()
-        store.reload()
+
+        // 仅用于截图核对加载动画的视觉效果：保持幕布常驻，不触发真实扫描。
+        if !loadingPreview { store.reload() }
         reloadAll()
+        runDiagnosticsIfNeeded()
+        if loadingPreview { loadingOverlay.setLoading(true) }
 
         if ProcessInfo.processInfo.environment["SHOT_DEMO"] == "1" {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
@@ -188,17 +410,17 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             }
         }
 
-
         // 回到前台自动重扫：在系统设置里给了权限、切回应用就会自己加载
         NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification,
                                                object: nil, queue: .main) { [weak self] _ in
-            guard let self, self.store.movies.isEmpty else { return }
+            guard let self, !self.loadingPreview, self.store.movies.isEmpty else { return }
             self.store.reload()
         }
     }
 
     private func buildRoot() -> NSView {
         let root = RootView()
+        let glassOff = ProcessInfo.processInfo.environment["GLASS"] == "0"   // 诊断用：关掉毛玻璃
 
         // ── 液态玻璃底层：真正模糊窗口后面的内容 ──
         let glass = NSVisualEffectView()
@@ -206,8 +428,10 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         glass.blendingMode = .behindWindow
         glass.state = .active
         glass.autoresizingMask = [.width, .height]
-        root.addSubview(glass)
-        glass.translatesAutoresizingMaskIntoConstraints = false
+        if !glassOff {
+            root.addSubview(glass)
+            glass.translatesAutoresizingMaskIntoConstraints = false
+        }
 
         // 一层极薄白色薄雾：让玻璃更亮，但仍完全透明
         let veil = NSView()
@@ -223,11 +447,16 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             veil.bottomAnchor.constraint(equalTo: root.bottomAnchor),
             veil.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             veil.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            glass.topAnchor.constraint(equalTo: root.topAnchor),
-            glass.bottomAnchor.constraint(equalTo: root.bottomAnchor),
-            glass.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            glass.trailingAnchor.constraint(equalTo: root.trailingAnchor),
         ])
+
+        if !glassOff {
+            NSLayoutConstraint.activate([
+                glass.topAnchor.constraint(equalTo: root.topAnchor),
+                glass.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+                glass.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                glass.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            ])
+        }
 
         // ── 顶栏（固定，不随内容滚动）──
         let header = NSView()
@@ -256,7 +485,7 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         searchField.translatesAutoresizingMaskIntoConstraints = false
         searchField.widthAnchor.constraint(equalToConstant: 200).isActive = true
 
-        let tabs = TabBar(names: ["JAV", "国产", "短剧"])
+        let tabs = TabBar(names: ["JAV", "国产"])
         tabs.selected = activeTab
         tabs.onChange = { [weak self] index in
             guard let self else { return }
@@ -298,12 +527,19 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         carousel.onNeedToggle = { [weak self] movie in self?.toggle(movie) }
         grid.onNeedPlay = { [weak self] movie, inApp in self?.play(movie, inApp: inApp) }
         grid.onNeedToggle = { [weak self] movie in self?.toggle(movie) }
-        grid.onNeedPreview = { [weak self] movie in self?.openShotViewer(movie) }
+        grid.onNeedPreview = { [weak self] movie in self?.previewOrPlay(movie) }
         grid.onNeedDelete = { [weak self] movie in self?.confirmDelete(movie) }
-        carousel.onNeedPreview = { [weak self] movie in self?.openShotViewer(movie) }
+        carousel.onNeedPreview = { [weak self] movie in self?.previewOrPlay(movie) }
         carousel.onNeedDelete = { [weak self] movie in self?.confirmDelete(movie) }
 
         contentScroll.documentView = content
+        // 滚动时只刷新“哪些卡片可见”，不重排整库
+        contentScroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification,
+                                               object: contentScroll.contentView,
+                                               queue: .main) { [weak self] _ in
+            self?.grid.cull()
+        }
         contentScroll.hasVerticalScroller = true
         contentScroll.autohidesScrollers = true
         contentScroll.drawsBackground = false
@@ -314,9 +550,7 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         root.addSubview(guochangPage)
         guochangPage.isHidden = true
 
-        duanjuPage.translatesAutoresizingMaskIntoConstraints = false
-        root.addSubview(duanjuPage)
-        duanjuPage.isHidden = true
+
         contentScroll.translatesAutoresizingMaskIntoConstraints = false
 
         // 读取不到目录时的提示条：红底容器 + 垂直居中的文字
@@ -363,10 +597,6 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         toast.translatesAutoresizingMaskIntoConstraints = false
 
         NSLayoutConstraint.activate([
-            duanjuPage.topAnchor.constraint(equalTo: contentScroll.topAnchor),
-            duanjuPage.bottomAnchor.constraint(equalTo: contentScroll.bottomAnchor),
-            duanjuPage.leadingAnchor.constraint(equalTo: contentScroll.leadingAnchor),
-            duanjuPage.trailingAnchor.constraint(equalTo: contentScroll.trailingAnchor),
             guochangPage.topAnchor.constraint(equalTo: contentScroll.topAnchor),
             guochangPage.bottomAnchor.constraint(equalTo: contentScroll.bottomAnchor),
             guochangPage.leadingAnchor.constraint(equalTo: contentScroll.leadingAnchor),
@@ -385,6 +615,16 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             toast.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -28),
             toast.heightAnchor.constraint(equalToConstant: 34),
             toast.widthAnchor.constraint(greaterThanOrEqualToConstant: 200),
+        ])
+
+        // 最后添加，保证加载幕布覆盖标题栏、内容区与其它提示。
+        loadingOverlay.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(loadingOverlay)
+        NSLayoutConstraint.activate([
+            loadingOverlay.topAnchor.constraint(equalTo: root.topAnchor),
+            loadingOverlay.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            loadingOverlay.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            loadingOverlay.trailingAnchor.constraint(equalTo: root.trailingAnchor),
         ])
         return root
     }
@@ -428,6 +668,14 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             .debounce(for: .milliseconds(60), scheduler: RunLoop.main)
             .sink { [weak self] _ in self?.reloadAll() }
             .store(in: &cancellables)
+        store.$isLoading
+            .removeDuplicates()
+            .sink { [weak self] loading in
+                guard let self else { return }
+                // 只在空页面的首次扫描时全屏遮罩；已有影库刷新不阻断操作。
+                self.loadingOverlay.setLoading(loading && self.store.movies.isEmpty)
+            }
+            .store(in: &cancellables)
     }
 
     func reloadAll() {
@@ -469,6 +717,98 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         grid.layoutSubtreeIfNeeded()
     }
 
+    // MARK: 诊断（仅在 LAYER_LOG=1 / SCROLL_BENCH=1 时跑）
+
+    private func runDiagnosticsIfNeeded() {
+        let env = ProcessInfo.processInfo.environment
+        if env["LAYER_LOG"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, let doc = self.content else { return }
+                let layers = debugCountLayers(doc.layer)
+                let shadowed = debugCountShadowLayers(doc.layer)
+                let views = debugCountViews(doc)
+                fputs("LAYER_LOG views=\(views) layers=\(layers) visibleCards=\(debugCountVisibleCards(self.grid)) allCards=\(self.grid.subviews.count) sample=\(self.store.movies.prefix(3).map { "\($0.code):\($0.duration.map { Int($0) } ?? -1)/\($0.resolution ?? "-")" }.joined(separator: ","))\n", stderr)
+            }
+        }
+        if env["SCROLL_LIVE"] != nil {
+            let at = Double(env["SCROLL_AT"] ?? "") ?? 5.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + at) { [weak self] in
+                self?.startLiveScroll(seconds: Double(env["SCROLL_LIVE_SEC"] ?? "") ?? 10)
+            }
+        }
+        if env["SCROLL_BENCH"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+                self?.benchScroll()
+            }
+        }
+    }
+
+    /// 以 60Hz 连续滚动 6 秒（真事件循环），用来量 App / WindowServer 的 CPU
+    private func startLiveScroll(seconds: Double) {
+        guard let doc = contentScroll.documentView else { return }
+        let clip = contentScroll.contentView
+        let maxY = max(0, doc.frame.height - clip.bounds.height)
+        guard maxY > 10 else { return }
+        var y: CGFloat = 0
+        var dir: CGFloat = 1
+        var tick = 0
+        let limit = Int(seconds * 60)
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { t in
+            y += 14 * dir
+            if y >= maxY { y = maxY; dir = -1 }
+            if y <= 0 { y = 0; dir = 1 }
+            clip.setBoundsOrigin(NSPoint(x: 0, y: y))
+            self.contentScroll.reflectScrolledClipView(clip)
+            tick += 1
+            if tick >= limit {
+                t.invalidate()
+                fputs("SCROLL_LIVE done ticks=\(tick) visibleCards=\(debugCountVisibleCards(self.grid)) allCards=\(self.grid.subviews.count)\n", stderr)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        fputs("SCROLL_LIVE start\n", stderr)
+    }
+
+    /// 模拟滚动 tick，分两档：只做 bounds+CA 提交 / 再加一次布局，统计主线程耗时
+    private func benchScroll() {
+        guard let doc = contentScroll.documentView else { return }
+        let clip = contentScroll.contentView
+        let maxY = max(0, doc.frame.height - clip.bounds.height)
+        guard maxY > 10 else { fputs("SCROLL_BENCH no scrollable content\n", stderr); return }
+
+        func run(layout: Bool) -> [Double] {
+            var times: [Double] = []
+            var y: CGFloat = 0
+            let ticks = 240
+            let step = max(4, min(30, maxY / 60))
+            for _ in 0..<ticks {
+                let t0 = CACurrentMediaTime()
+                y += step
+                if y > maxY { y = 0 }
+                clip.setBoundsOrigin(NSPoint(x: 0, y: y))
+                contentScroll.reflectScrolledClipView(clip)
+                if layout { doc.layoutSubtreeIfNeeded() }
+                CATransaction.flush()
+                times.append((CACurrentMediaTime() - t0) * 1000)
+            }
+            return times
+        }
+
+        func report(_ tag: String, _ times: [Double]) {
+            let sorted = times.sorted()
+            let avg = times.reduce(0, +) / Double(times.count)
+            let p50 = sorted[sorted.count / 2]
+            let p95 = sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))]
+            fputs(String(format: "SCROLL_BENCH[%@] ticks=%d avg=%.2fms p50=%.2fms p95=%.2fms max=%.2fms docH=%.0f visible=%d\n",
+                         tag, times.count, avg, p50, p95, sorted.last ?? 0, doc.frame.height,
+                         debugCountVisibleCards(grid)), stderr)
+        }
+
+        _ = run(layout: false)                      // 预热
+        report("commit", run(layout: false))
+        report("commit+layout", run(layout: true))
+    }
+
     // MARK: 删除（移到废纸篓）
 
     func confirmDelete(_ movie: Movie) {
@@ -497,7 +837,18 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
 
     // MARK: 剧照浏览器（居中）
 
+    /// 点封面：剧照展示已停用时，直接把这部片播放起来（代码保留，开关恢复即可回到剧照）
+    private func previewOrPlay(_ movie: Movie) {
+        if FeatureFlags.shotsEnabled {
+            openShotViewer(movie)
+        } else {
+            play(movie, inApp: false)
+        }
+    }
+
     private func openShotViewer(_ movie: Movie) {
+        // 剧照（T-xx）展示先停用：开关在 FeatureFlags.shotsEnabled（代码保留）
+        guard FeatureFlags.shotsEnabled else { return }
         hideShotViewer()
         guard let root = window.contentView else { return }
         let viewer = ShotViewer(frame: root.bounds)
@@ -608,7 +959,7 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         let tab = activeTab
         contentScroll.isHidden = tab != 0
         guochangPage.isHidden = tab != 1
-        duanjuPage.isHidden = tab != 2
+        if tab != 1 { guochangPage.stopPlayback() }
 
         switch tab {
         case 0:
@@ -617,14 +968,10 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
                 store.root = target
                 store.reload()
             }
-        case 1:
-            guochangPage.load(root: guochangRoot)   // 独立页面，自己扫描自己渲染
         default:
-            if duanjuPage.url == nil { duanjuPage.load() }   // 短剧：嵌入网页
+            guochangPage.load(root: guochangRoot)   // 国产：左侧列表 + 右侧播放
         }
     }
-
-    @objc func refreshFromMenu() { store.reload() }
 
     // MARK: 元数据检查 / 补全（后台跑 javdb.py，前台显示进度）
 
@@ -745,6 +1092,11 @@ final class AppController: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         }
     }
 
+    @objc func refreshFromMenu() {
+        store.reload()
+        reloadAll()
+    }
+
     func setSort(_ mode: LibraryStore.SortMode) {
         store.sort = mode
         reloadAll()
@@ -779,4 +1131,43 @@ final class PassThroughView: NSView {
         let hit = super.hitTest(point)
         return hit === self ? nil : hit
     }
+}
+
+// MARK: - 诊断计数（只给 LAYER_LOG / SCROLL_BENCH 用）
+
+private func _layerWalk(_ layer: CALayer?, _ body: (CALayer) -> Int) -> Int {
+    guard let layer else { return 0 }
+    var n = body(layer)
+    for sub in layer.sublayers ?? [] { n += _layerWalk(sub, body) }
+    return n
+}
+
+func debugCountLayers(_ layer: CALayer?) -> Int {
+    _layerWalk(layer) { _ in 1 }
+}
+
+func debugCountShadowLayers(_ layer: CALayer?) -> Int {
+    _layerWalk(layer) { ($0.shadowOpacity > 0 && $0.shadowRadius > 0) ? 1 : 0 }
+}
+
+func debugCountViews(_ view: NSView) -> Int {
+    var n = 1
+    for sub in view.subviews { n += debugCountViews(sub) }
+    return n
+}
+
+func debugCountVisibleCards(_ grid: NSView) -> Int {
+    grid.subviews.filter { !$0.isHidden }.count
+}
+
+func debugShadowProps(_ layer: CALayer?) -> String {
+    var out: [String] = []
+    func walk(_ l: CALayer) {
+        if l.shadowRadius > 0 || l.shadowOpacity > 0 {
+            out.append("\(type(of: l)):op=\(l.shadowOpacity),r=\(l.shadowRadius)")
+        }
+        for s in l.sublayers ?? [] { walk(s) }
+    }
+    if let layer { walk(layer) }
+    return out.prefix(3).joined(separator: " | ") + " (n=\(out.count))"
 }

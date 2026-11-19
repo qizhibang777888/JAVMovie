@@ -31,12 +31,16 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>LSApplicationCategoryType</key><string>public.app-category.video</string>
+  <key>NSAppTransportSecurity</key>
+  <dict>
+    <key>NSAllowsLocalNetworking</key><true/>
+  </dict>
 </dict>
 </plist>
 PLIST
 
 # 复用已有的图标
-ICON="../movieshelf/MovieShelf.app/Contents/Resources/AppIcon.icns"
+ICON="AppIcon.icns"          # 图标已随源码放在 native/ 下
 if [ -f "$ICON" ]; then cp "$ICON" "$APP/Contents/Resources/AppIcon.icns"; fi
 
 # 优先用固定证书签名（TCC 授权按签名身份记，证书固定 => 重建不掉权限）
